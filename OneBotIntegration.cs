@@ -1,4 +1,4 @@
-﻿using Exiled.API.Features;
+using Exiled.API.Features;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
@@ -19,8 +19,6 @@ namespace OneBotIntegration
         {
             base.OnEnabled();
             Log.Info("插件已启用，正在启动反向 WebSocket 连接...");
-
-            // 启动反向 WebSocket 连接
             _cancellationTokenSource = new CancellationTokenSource();
             Task.Run(() => ConnectToOneBot(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
         }
@@ -45,12 +43,30 @@ namespace OneBotIntegration
 
                 while (_webSocket.State == WebSocketState.Open)
                 {
-                    var buffer = new ArraySegment<byte>(new byte[1024]);
+                    var buffer = new ArraySegment<byte>(new byte[4096]);
                     var result = await _webSocket.ReceiveAsync(buffer, cancellationToken);
-                    var message = Encoding.UTF8.GetString(buffer.Array, 0, result.Count);
 
-                    Log.Info($"收到来自 OneBot 的消息: {message}");
-                    HandleMessage(message);
+                    var messageBuilder = new StringBuilder();
+                    messageBuilder.Append(Encoding.UTF8.GetString(buffer.Array, 0, result.Count));
+
+                    while (!result.EndOfMessage)
+                    {
+                        result = await _webSocket.ReceiveAsync(buffer, cancellationToken);
+                        messageBuilder.Append(Encoding.UTF8.GetString(buffer.Array, 0, result.Count));
+                    }
+
+                    var message = messageBuilder.ToString();
+
+                    Log.Debug($"收到原始消息: {message}");
+
+                    if (IsValidJson(message))
+                    {
+                        HandleMessage(message);
+                    }
+                    else
+                    {
+                        Log.Warn($"收到非JSON消息，跳过处理: {message}");
+                    }
                 }
             }
             catch (Exception ex)
@@ -59,13 +75,36 @@ namespace OneBotIntegration
             }
         }
 
+        private bool IsValidJson(string strInput)
+        {
+            if (string.IsNullOrWhiteSpace(strInput))
+                return false;
+
+            strInput = strInput.Trim();
+
+            if ((strInput.StartsWith("{") && strInput.EndsWith("}")) ||
+                (strInput.StartsWith("[") && strInput.EndsWith("]")))
+            {
+                try
+                {
+                    JsonConvert.DeserializeObject<dynamic>(strInput);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
         private void HandleMessage(string jsonMessage)
         {
             try
             {
                 Log.Info("正在处理收到的消息...");
 
-                // 解析 JSON 消息
                 var messageEvent = JsonConvert.DeserializeObject<MessageEvent>(jsonMessage);
 
                 // 检查消息类型（私聊或群聊）
@@ -152,6 +191,12 @@ namespace OneBotIntegration
                         case "/cx":
                             Log.Info("收到查询在线人数命令...");
                             QueryOnlinePlayers().GetAwaiter().GetResult();
+                            break;
+
+                        case "/adcx":
+                            Log.Info("收到AD查询在线人数命令...");
+                            string adcxQQNumber = messageEvent.UserId.ToString();
+                            ADQueryOnlinePlayers(adcxQQNumber).GetAwaiter().GetResult();
                             break;
 
                         case "/verify_qq":
@@ -253,8 +298,18 @@ namespace OneBotIntegration
                 await SendQQMessageAsync($"未找到玩家 {steam64id}。");
             }
         }
-        private async Task QueryOnlinePlayers()
+        private async Task ADQueryOnlinePlayers(string qqNumber)
         {
+            Log.Info($"正在验证 QQ 号: {qqNumber}");
+
+            // 验证QQ号是否在允许列表中
+            if (!Config.AllowedQQs.Contains(qqNumber))
+            {
+                Log.Info($"QQ {qqNumber} 不在允许的列表中，无法使用详细查询功能。");
+                await SendQQMessageAsync($"QQ {qqNumber} 不在允许的列表中，无法使用详细查询功能。");
+                return;
+            }
+
             try
             {
                 // 获取当前在线玩家
@@ -267,6 +322,26 @@ namespace OneBotIntegration
                 {
                     message += $"- {player.Nickname} ({player.UserId})\n";
                 }
+
+                // 发送消息到 QQ
+                await SendQQMessageAsync(message);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"查询在线人数时出错: {ex.Message}");
+                await SendQQMessageAsync("查询在线人数时出错，请稍后重试。");
+            }
+        }
+
+        private async Task QueryOnlinePlayers()
+        {
+            try
+            {
+                // 获取当前在线玩家数量
+                int playerCount = Player.List.Count();
+
+                // 构造消息内容 - 只返回人数
+                string message = $"当前服务器在线人数: {playerCount}";
 
                 // 发送消息到 QQ
                 await SendQQMessageAsync(message);
@@ -301,6 +376,7 @@ namespace OneBotIntegration
                                  "/kick_player <steam64id> - 踢出玩家\n" +
                                  "/verify_qq <qq号> - 验证 QQ 号\n" +
                                  "/cx - 查询当前服务器在线人数\n" +
+                                 "/adcx - 查询当前服务器在线steam64ID " +
                                  "/help - 显示帮助信息";
 
             await SendQQMessageAsync(helpMessage);
